@@ -366,7 +366,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         if position_ids is None:
             # 假设这里同一batch中的不同sequence缓存的kvcache长度不同，但是会填充到max_seq_len，所以cache.get_seq_length()返回的是一个整数:max_seq_len
-            past_seen_tokens = cache.get_seq_length() if cache is not None else 0    # prefill阶段不为0，decode阶段是0
+            past_seen_tokens = cache.get_seq_length() if cache is not None else 0    # prefill阶段为0，decode阶段不是0
             position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
             position_ids = position_ids.unsqueeze(0)
 
