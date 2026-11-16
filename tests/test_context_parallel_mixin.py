@@ -14,10 +14,11 @@
 """Context parallel tester mixin for model tests."""
 
 import copy
+import types
 from abc import ABC, abstractmethod
 
 from transformers import is_torch_available
-from transformers.testing_utils import SINGLE_PROCESS_DEVICES, is_fsdp_test, torch_device
+from transformers.testing_utils import SINGLE_PROCESS_DEVICES, is_context_parallel_test, torch_device
 
 from .distributed_testing_utils import _deterministic_init_model_dir, run_distributed
 from .test_fsdp_mixin import _get_available_fsdp_workers
@@ -45,118 +46,116 @@ CONTEXT_PARALLEL_TEST_MODEL_TYPES = {
 
 # The plan of a decoder-only base model: its layers run on this rank's slice, their attention on the whole sequence.
 CP_PLAN = {"layers.*": "cp_split_sequence", "layers.*.self_attn": "cp_ulysses"}
-CP_RTOL = 1e-5
-CP_ATOL = 1e-5
 
 
-class _MeshStub:
-    """A `cp` mesh that only has to report its size and the caller's rank."""
-
-    def __init__(self, size, rank=0):
-        self._size, self._rank = size, rank
-
-    def size(self):
-        return self._size
-
-    def get_local_rank(self):
-        return self._rank
-
-
-def _resolve_cp_plan(model):
-    """`model.cp_plan` with `CP_PLAN` on the modules of its base model, `*` replaced by the layer numbers."""
-    base_model_name = "" if model.base_model is model else model.base_model_prefix
+def _cp_plan(model):
+    """`model.cp_plan` with `CP_PLAN` on its base model, `*` replaced by the layer numbers."""
+    prefix = "" if model.base_model is model else f"{model.base_model_prefix}."
     plan = dict(model.cp_plan)
     for name, _ in model.base_model.named_modules():
-        if (style := _get_parameter_plan(name, CP_PLAN, is_weight=False)) is not None:
-            plan[f"{base_model_name}.{name}" if base_model_name else name] = style
-    # both rules have to match: layers without the attention style would run attention on this rank's slice only
-    for style in CP_PLAN.values():
-        if style not in plan.values():
-            raise ValueError(f"the `{style}` rule of `{CP_PLAN}` names no module of {type(model).__name__}")
+        if style := _get_parameter_plan(name, CP_PLAN, is_weight=False):
+            plan[prefix + name] = style
+    # a layer without the attention style would run its attention on this rank's slice only
+    if missing := set(CP_PLAN.values()) - set(plan.values()):
+        raise ValueError(f"{sorted(missing)} of `{CP_PLAN}` name no module of {type(model).__name__}")
     return plan
 
 
 def _refusal(config, model_class, cp_size):
-    """
-    The error that stops `model_class` from running with context parallelism, or `None`. The model is built from the
-    config a checkpoint reloads, as the workers do.
-    """
+    """The error that stops `model_class` from running with context parallelism, or `None`."""
+    mesh = types.SimpleNamespace(size=lambda: cp_size, get_local_rank=lambda: 0)
     try:
-        with torch.device("meta"):
+        with torch.device("meta"):  # from the config the workers reload from the checkpoint
             model = model_class(type(config).from_dict(config.to_diff_dict()))
-        apply_context_parallelism(model, _MeshStub(cp_size), _resolve_cp_plan(model))
+        apply_context_parallelism(model, mesh, _cp_plan(model))
     except Exception as error:
         return error
     return None
 
 
-def _tiny_batch(config, batch_size, seq_len, packed=False, seed=0):
-    """A batch every rank builds alike."""
-    generator = torch.Generator().manual_seed(seed)
-    input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), generator=generator)
-    if not packed:
-        return input_ids, None
-    # two documents back to back, which `position_ids` has to describe for the whole sequence
-    first = seq_len // 2
-    position_ids = torch.cat([torch.arange(first), torch.arange(seq_len - first)]).expand(batch_size, -1)
-    return input_ids, position_ids
-
-
-def _compare_with_unsharded(init_dir, batch, model_class):
-    """
-    Run the full `batch` through an unsharded model and through the same weights with context parallelism installed,
-    then compare the loss, this rank's slice of the logits and every gradient.
-    """
-    reference = model_class.from_pretrained(init_dir)
-    reference_output = reference(**batch)
-    reference_output.loss.backward()
-    reference_grads = {
-        name: param.grad.clone() for name, param in reference.named_parameters() if param.grad is not None
-    }
-    reference_loss, reference_logits = reference_output.loss.detach(), reference_output.logits.detach()
-    del reference
-
+def _load_cp_and_reference_models(model_dir, model_class):
+    """The checkpoint with the context parallel plan installed, the same weights unsharded, and the `cp` mesh."""
     cp_mesh = init_device_mesh("cpu", (dist.get_world_size(),))
-    cp_rank, cp_size = cp_mesh.get_local_rank(), cp_mesh.size()
-    model = model_class.from_pretrained(init_dir)
-    apply_context_parallelism(model, cp_mesh, _resolve_cp_plan(model))
-    output = model(**batch)
-    output.loss.backward()
-
-    # every rank computed the loss of the whole sequences, and its own slice of the logits
-    expected_logits = reference_logits.chunk(cp_size, dim=1)[cp_rank]
-    torch.testing.assert_close(output.logits, expected_logits, rtol=CP_RTOL, atol=CP_ATOL, msg="Logits mismatch")
-    torch.testing.assert_close(output.loss, reference_loss, rtol=CP_RTOL, atol=CP_ATOL, msg="Loss mismatch")
-
-    # FSDP2 averages the gradients over the cp ranks
-    for name, param in model.named_parameters():
-        expected = reference_grads.get(name)
-        if param.grad is None or expected is None:
-            assert param.grad is None and expected is None, f"Only one of the two runs has a gradient for {name}"
-            continue
-        grad = param.grad.clone()
-        dist.all_reduce(grad, group=cp_mesh.get_group())
-        torch.testing.assert_close(
-            grad / cp_size, expected, rtol=CP_RTOL, atol=CP_ATOL, msg=f"Gradient mismatch for {name}"
-        )
+    model_cp = model_class.from_pretrained(model_dir)
+    apply_context_parallelism(model_cp, cp_mesh, _cp_plan(model_cp))
+    model_ref = model_class.from_pretrained(model_dir)
+    return model_cp, model_ref, cp_mesh
 
 
-def _test_cp_matches_unsharded(rank, config, model_class, packed):
-    """The loss, this rank's logits and every gradient of a context parallel model match the run on whole sequences."""
-    with _deterministic_init_model_dir(rank, config, torch.float32, model_class) as init_dir:
-        input_ids, position_ids = _tiny_batch(config, batch_size=2, seq_len=8, packed=packed)
-        batch = {"input_ids": input_ids, "labels": input_ids.clone(), "use_cache": False}
-        if position_ids is not None:
-            batch["position_ids"] = position_ids
-        _compare_with_unsharded(init_dir, batch, model_class)
-        # `init_dir` is rank 0's temporary directory: wait for the other ranks before it is removed
+def _inputs_and_labels(config, seq_len=8, packed=False, padded=False):
+    """
+    Two rows of `seq_len` tokens, with themselves as labels. `packed` puts two documents in every row, so
+    `position_ids` restart mid-sequence; `padded` masks the end of the first row and the start of the second.
+    """
+    input_ids = torch.randint(0, config.vocab_size, (2, seq_len), generator=torch.Generator().manual_seed(0))
+    inputs, labels = {"input_ids": input_ids}, input_ids.clone()
+    if packed:
+        first = seq_len // 2
+        inputs["position_ids"] = torch.cat([torch.arange(first), torch.arange(seq_len - first)]).expand(2, -1)
+    if padded:
+        attention_mask = torch.ones_like(input_ids)
+        attention_mask[0, -3:] = 0
+        attention_mask[1, :2] = 0
+        inputs["attention_mask"] = attention_mask
+        labels = labels.masked_fill(attention_mask == 0, -100)
+    return inputs, labels
+
+
+def _test_cp_forward_impl(rank, config, model_class, atol, rtol, batch_options):
+    """This rank's slice of the logits matches the logits of the whole sequences."""
+    with _deterministic_init_model_dir(rank, config, torch.float32, model_class) as model_dir:
+        model_cp, model_ref, cp_mesh = _load_cp_and_reference_models(model_dir, model_class)
+        inputs, _ = _inputs_and_labels(config, **batch_options)
+
+        with torch.no_grad():
+            logits = model_ref(**inputs, use_cache=False).logits
+            logits_cp = model_cp(**inputs).logits
+
+        # this rank's slice of the sequences padded to a multiple of `cp_size`: the padding at the end of the last
+        # slice has no counterpart in the unsharded logits
+        start = cp_mesh.get_local_rank() * logits_cp.shape[1]
+        expected = logits[:, start : start + logits_cp.shape[1]]
+        logits_cp = logits_cp[:, : expected.shape[1]]
+        torch.testing.assert_close(logits_cp, expected, atol=atol, rtol=rtol, msg="CP and non-CP logits differ")
+        dist.barrier()
+
+
+def _test_cp_backward_impl(rank, config, model_class, atol, rtol, batch_options):
+    """Every rank reports the loss of the whole sequences, and the gradients averaged over the cp ranks match."""
+    with _deterministic_init_model_dir(rank, config, torch.float32, model_class) as model_dir:
+        model_cp, model_ref, cp_mesh = _load_cp_and_reference_models(model_dir, model_class)
+        inputs, labels = _inputs_and_labels(config, **batch_options)
+
+        loss = model_ref(**inputs, labels=labels, use_cache=False).loss
+        loss.backward()
+        loss_cp = model_cp(**inputs, labels=labels).loss
+        loss_cp.backward()
+        torch.testing.assert_close(loss_cp, loss, atol=atol, rtol=rtol, msg="CP and non-CP losses differ")
+
+        # the gradient of this rank's slice, averaged over the cp ranks as FSDP2 does: a parameter the slice does not
+        # reach (an expert no token of it is routed to) contributes nothing
+        for (name, param), (_, param_cp) in zip(
+            model_ref.named_parameters(), model_cp.named_parameters(), strict=True
+        ):
+            grad = torch.zeros_like(param) if param.grad is None else param.grad
+            grad_cp = torch.zeros_like(param_cp) if param_cp.grad is None else param_cp.grad.clone()
+            dist.all_reduce(grad_cp, group=cp_mesh.get_group())
+            torch.testing.assert_close(grad_cp / cp_mesh.size(), grad, atol=atol, rtol=rtol, msg=f"{name} differs")
         dist.barrier()
 
 
 class ContextParallelTesterMixin(ABC):
-    """Context parallel tests on 2 ranks, added to the causal language model test classes."""
+    """
+    Mixin for context parallel tests. Add to model test classes alongside ModelTesterMixin.
 
-    cp_world_size: int = 2
+    The model_tester (e.g., CausalLMModelTester) already provides `get_config()` and `causal_lm_class`; every test
+    loads that tiny model on `context_parallel_size` CPU ranks, each holding a slice of every sequence, and compares
+    it with the same weights on the whole sequences.
+    """
+
+    context_parallel_size: int = 2
+    context_parallel_atol: float = 1e-5
+    context_parallel_rtol: float = 1e-5
 
     @property
     @abstractmethod
@@ -164,36 +163,56 @@ class ContextParallelTesterMixin(ABC):
         """The model tester instance (e.g., CausalLMModelTester)."""
         ...
 
-    def _run_cp_matches_unsharded(self, packed):
+    def _skip_if_cp_not_supported(self):
         if torch._C._get_accelerator().type == "mps":
             self.skipTest("The device mesh is built on the default accelerator, which MPS cannot back")
         if torch_device in SINGLE_PROCESS_DEVICES:
             self.skipTest(f"Distributed tests spawn one process per device, which {torch_device!r} doesn't allow")
-        if _get_available_fsdp_workers() < self.cp_world_size:
-            self.skipTest(f"Need at least {self.cp_world_size} workers")
-        config = copy.deepcopy(self.model_tester.get_config())
-        if (
-            CONTEXT_PARALLEL_TEST_MODEL_TYPES is not None
-            and config.model_type not in CONTEXT_PARALLEL_TEST_MODEL_TYPES
-        ):
-            self.skipTest(f"Context parallel tests are not enabled for model_type={config.model_type!r}")
+        if _get_available_fsdp_workers() < self.context_parallel_size:
+            self.skipTest(f"Need at least {self.context_parallel_size} workers")
+        model_type = self.model_tester.get_config().model_type
+        if CONTEXT_PARALLEL_TEST_MODEL_TYPES is not None and model_type not in CONTEXT_PARALLEL_TEST_MODEL_TYPES:
+            self.skipTest(f"Context parallel tests are not enabled for model_type={model_type!r}")
 
+    def _get_cp_config(self):
+        config = copy.deepcopy(self.model_tester.get_config())
         # the auxiliary load-balancing loss of the MoE models does not sum over the tokens of a sequence
         if hasattr(config.get_text_config(), "output_router_logits"):
             config.get_text_config().output_router_logits = False
-        model_class = self.model_tester.causal_lm_class
-        if (refusal := _refusal(config, model_class, self.cp_world_size)) is not None:
+        return config
+
+    def _run_cp_test(self, test_impl, **batch_options):
+        self._skip_if_cp_not_supported()
+        config, model_class = self._get_cp_config(), self.model_tester.causal_lm_class
+        if (refusal := _refusal(config, model_class, self.context_parallel_size)) is not None:
             self.skipTest(f"Context parallelism cannot run this model: {refusal}")
-        run_distributed(world_size=self.cp_world_size, backend="gloo")(_test_cp_matches_unsharded)(
-            config, model_class, packed
+        run_distributed(world_size=self.context_parallel_size, backend="gloo")(test_impl)(
+            config, model_class, self.context_parallel_atol, self.context_parallel_rtol, batch_options
         )
 
-    @is_fsdp_test
-    def test_cp_matches_unsharded(self):
-        """The loss, this rank's logits and every gradient match the run on whole sequences."""
-        self._run_cp_matches_unsharded(packed=False)
+    @is_context_parallel_test
+    def test_cp_forward(self):
+        self._run_cp_test(_test_cp_forward_impl)
 
-    @is_fsdp_test
-    def test_cp_matches_unsharded_packed(self):
-        """Two documents in every sequence, so `position_ids` restart mid-sequence."""
-        self._run_cp_matches_unsharded(packed=True)
+    @is_context_parallel_test
+    def test_cp_forward_packed(self):
+        """Two documents in every sequence: `position_ids` restart mid-sequence, and so does the mask."""
+        self._run_cp_test(_test_cp_forward_impl, packed=True)
+
+    @is_context_parallel_test
+    def test_cp_forward_padded(self):
+        """7 tokens over 2 ranks, so the model pads the sequences, and a 2D `attention_mask` of padded rows."""
+        self._run_cp_test(_test_cp_forward_impl, seq_len=7, padded=True)
+
+    @is_context_parallel_test
+    def test_cp_backward(self):
+        self._run_cp_test(_test_cp_backward_impl)
+
+    @is_context_parallel_test
+    def test_cp_backward_packed(self):
+        self._run_cp_test(_test_cp_backward_impl, packed=True)
+
+    @is_context_parallel_test
+    def test_cp_backward_padded(self):
+        """The padding the model appends and the masked positions are not trained on."""
+        self._run_cp_test(_test_cp_backward_impl, seq_len=7, padded=True)
