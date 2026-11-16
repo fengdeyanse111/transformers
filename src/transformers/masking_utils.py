@@ -748,7 +748,7 @@ class AttentionMaskInterface(GeneralInterface):
 # Global AttentionMaskInterface shared by all models which do not need to overwrite any of the existing ones
 ALL_MASK_ATTENTION_FUNCTIONS: AttentionMaskInterface = AttentionMaskInterface()
 
-
+# 正常情况下一个batch的一行中是一个sequence，但是有些情况为了压缩会让多个sequence存在于同一行。这里的目的是为了计算出同一行中不同sequence对应的掩码
 def find_packed_sequence_indices(position_ids: torch.Tensor) -> torch.Tensor | None:
     """
     Find the indices of the sequence to which each new query token in the sequence belongs when using packed
@@ -831,6 +831,7 @@ def _preprocess_mask_arguments(
         kv_offset (`int`):
             An offset to indicate at which first position the key and values states will refer to.
     """
+    # 提前退出的三种情况：1.mask参数已经是4D，说明掩码已经准备好了，或者是自定义的掩码。2.PageAttention：这种由后端自行管理mask。3.当前注意力实现不在“需要 mask 的实现”列表里（如 FlashAttention、TGI/vLLM 自定义后端），它们内部处理 mask
     # If the mask is already 4D, simply return as-is (it was already prepared, or it is custom)
     if isinstance(attention_mask, (torch.Tensor, BlockMask)) and len(attention_mask.shape) == 4:
         return True, attention_mask, None, None, None, None, None
@@ -851,20 +852,24 @@ def _preprocess_mask_arguments(
     if attention_mask is not None and attention_mask.ndim == 2:
         attention_mask = attention_mask.to(device=inputs_embeds.device, dtype=torch.bool)
 
-    q_length = inputs_embeds.shape[1]
+    q_length = inputs_embeds.shape[1]    # 本次query的长度（max_seq_len)
     # If using a cache, it can give all information about mask sizes based on seen tokens
+    # 
     if cache is not None:
-        q_offset = cache.get_query_offset(layer_idx)
+        q_offset = cache.get_query_offset(layer_idx)    # 获得本次query的offset
         # To avoid graph breaks, StaticLayer returns a tensor instead of an int -> this has no impact on the ops, but
         # we need the correct device
-        q_offset = q_offset.to(inputs_embeds.device) if isinstance(q_offset, torch.Tensor) else q_offset
+        q_offset = q_offset.to(inputs_embeds.device) if isinstance(q_offset, torch.Tensor) else q_offset    # 将q_offset移动到GPU
+        # 返回本层kvcache中存放的kv的长度以及本层kv的offset，如果是full-attention则kv_offset=0,但如果是slidding-attention则kv_offset可能>0。
+        # 注意到这里get_mask_sizes函数传入了q_length，所以对于kv_length：包含本层kvcache之前缓存的kv长度，还包含本次query的长度q_length
         kv_length, kv_offset = cache.get_mask_sizes(q_length, layer_idx)
     # Otherwise, we infer based on our input
-    else:
+    else:        # cache is None
         q_offset = 0
         # 1. Rely on input directly
         if attention_mask is None:
             # For encoder-decoders, use encoder_hidden_states to infer kv_length if provided
+            # 如果是encoder-decoder类型的Transformer,将kv_length设置为encoder的输出(batch_size, kv_length, hidden_size);如果是decoder-only类型的Transformer，将kv_length设置为q_length。
             kv_length = encoder_hidden_states.shape[1] if encoder_hidden_states is not None else q_length
             kv_offset = 0
         # 2. Rely on the mask instead - needed for special cases like prefix tuning in PEFT
@@ -873,6 +878,7 @@ def _preprocess_mask_arguments(
         # to be accounted for (usually, they should never use a cache). In general, the mask should always
         # match with the input sizes nonetheless (i.e. it does not affect others).
         # Conclusion: "prefix tuning is evil"
+        # 这里attention_mask.shape[-1]可能大于q_length,比如有Prompt Prefix的时候
         else:
             kv_length, kv_offset = attention_mask.shape[-1], 0
 
@@ -884,8 +890,9 @@ def _preprocess_mask_arguments(
         # The position ids are sometimes just unsqueezed, without being expanded
         if batch_size != position_ids.shape[0]:
             position_ids = position_ids.expand(batch_size, -1)
+        # 这里简单理解为返回None即可
         packed_sequence_mask = find_packed_sequence_indices(position_ids)
-
+    # 对于我的例子，其实这个函数有用的其实就是返回后面四个参数
     return False, attention_mask, packed_sequence_mask, q_length, kv_length, q_offset, kv_offset
 
 
@@ -894,6 +901,9 @@ def find_first_full_attention_index(cache: Cache | None) -> int:
     Return the index of the first full attention layer inside `cache` if any and if possible to find it.
     Otherwise, returns 0, i.e. the first layer.
     """
+    # 找到cache中第一个full-attention层对应的层数，即保留所有历史token kvcache的层
+    # is_sliding是滑动窗口注意力层：只保留最近window_size个token kvcache；is_linear是线性注意力层；is_dummy是空层，不存kvcache，在跨层kvcache共享机制中存在，在这里只是为了占位
+    # 这里cache.is_sliding/is_linear/is_dummy都是一个bool列表，长度是模型层数，表示该层是否是滑动窗口注意力/线性注意力/dummy，如果都不是就是full_attention
     if isinstance(cache, Cache):
         is_full = [
             not is_sliding and not is_linear and not is_dummy
@@ -958,7 +968,7 @@ def create_causal_mask(
     """
     # Power feature: if `is_causal` is False, then fallback to bi-directional mask for bi-directional attention.
     # It allows to use decoder-only models with bi-directional attention as well
-    if not getattr(config, "is_causal", True):
+    if not getattr(config, "is_causal", True):        # 如果不是因果模型，就调用创建双向掩码
         return create_bidirectional_mask(
             config,
             inputs_embeds,
@@ -972,7 +982,8 @@ def create_causal_mask(
     # If we have a hybrid cache structure (i.e. sliding or linear layers), here we want to create the mask for the full layers
     if layer_idx is None:
         layer_idx = find_first_full_attention_index(cache)
-
+    # 如果是Prefill阶段：q_length=kv_length=Prompt长度,q_offset=kv_offset=0.
+    # 如果是Decode阶段：q_length=1,kv_length=kvcache中存的token长度+q_length，q_offset=kvcache中存的token长度，kv_offset=0.
     early_exit, attention_mask, packed_sequence_mask, q_length, kv_length, q_offset, kv_offset = (
         _preprocess_mask_arguments(config, inputs_embeds, attention_mask, cache, position_ids, layer_idx)
     )
