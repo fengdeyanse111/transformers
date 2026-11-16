@@ -108,7 +108,7 @@ class DistributedMixin:
                 self._pp_plan.update({f"{name}.{k}": v for k, v in plan.copy().items()})
             if plan := getattr(module, "_fsdp_plan", None):
                 self._fsdp_plan.update({f"{name}.{k}": v for k, v in plan.copy().items()})
-        # context parallelism installs `"cp_model"` on the model it is applied to, whatever its plan
+        # the model itself, `""` always gets "cp_model" (refuses a cache, padding, label split, loss reduction)
         self._cp_plan = {"": "cp_model", **self._cp_plan}
 
     @property

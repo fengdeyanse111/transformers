@@ -252,10 +252,12 @@ class ModelContextParallel(ContextParallelLayer):
         return output
 
 
-ALL_CP_STYLES = {}
-ALL_CP_STYLES["cp_model"] = ModelContextParallel()
-ALL_CP_STYLES["cp_split_sequence"] = SplitSequenceParallel()
-ALL_CP_STYLES["cp_ulysses"] = UlyssesAttention()
+ALL_CP_STYLES = {
+    "cp_model": ModelContextParallel(),
+    "cp_split_sequence": SplitSequenceParallel(),
+    "cp_ulysses": UlyssesAttention(),
+}
+
 
 def apply_context_parallelism(model: nn.Module, cp_mesh: DeviceMesh, cp_plan: dict[str, str]) -> nn.Module:
     """
