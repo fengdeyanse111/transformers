@@ -47,7 +47,7 @@ from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.loss.loss_utils import ForCausalLMLoss
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-from transformers.testing_utils import is_fsdp_test
+from transformers.testing_utils import is_context_parallel_test
 from transformers.utils import is_torch_greater_or_equal
 
 from ..distributed_testing_utils import run_distributed
@@ -313,7 +313,7 @@ def _test_forward_refusals(rank, cp_size):
         model(input_ids=input_ids, past_key_values=DynamicCache())
 
 
-@is_fsdp_test
+@is_context_parallel_test
 class TestUlyssesDistributed(unittest.TestCase):
     """Two CPU ranks, gloo: the attention against plain attention on the full sequence."""
 
@@ -334,7 +334,7 @@ class TestUlyssesDistributed(unittest.TestCase):
         run_distributed(world_size=2, backend="gloo")(_test_attention_kwargs)(2)
 
 
-@is_fsdp_test
+@is_context_parallel_test
 class TestApplyContextParallelism(unittest.TestCase):
     """Two CPU ranks, gloo: a model with the plan installed by hand, against the same weights on the full sequences."""
 
@@ -889,7 +889,7 @@ class TestContextParallelPlan(unittest.TestCase):
                 model._resolve_parallel_plans(DistributedConfig(cp_size=2))
 
 
-@is_fsdp_test
+@is_context_parallel_test
 class TestContextParallelModel(unittest.TestCase):
     """A model sharded with context parallelism reproduces the same run on the full sequences."""
 
