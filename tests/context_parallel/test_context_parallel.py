@@ -50,8 +50,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.testing_utils import is_context_parallel_test
 from transformers.utils import is_torch_greater_or_equal
 
-from ..distributed_testing_utils import run_distributed
-from ..test_fsdp_mixin import _deterministic_init_model_dir, _distributed_tmpdir
+from ..distributed_testing_utils import _deterministic_init_model_dir, _distributed_tmpdir, run_distributed
 
 
 class _MeshStub:
