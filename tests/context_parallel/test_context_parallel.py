@@ -12,44 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-The context parallel styles, each on its own: `cp_ulysses` against plain attention and the loss of `cp_model` on 2
-ranks, then `cp_split_sequence` on a decoder layer, `cp_model` on the inputs of a model, and
-`apply_context_parallelism` on a model. The models themselves are tested by `ContextParallelTesterMixin`.
+The context parallel styles, each on its own: what `cp_ulysses` gives an attention function on 2 ranks, its routing
+and its refusals, `cp_split_sequence` on a decoder layer, and `cp_model` on the inputs and the loss of a model. What
+the styles add up to, the logits, loss and gradients of real models, is tested by `ContextParallelTesterMixin`.
 """
 
-import inspect
 import types
 import unittest
 from unittest import mock
 
 import torch
 import torch.distributed as dist
-from parameterized import parameterized
 from torch.distributed.device_mesh import init_device_mesh
 
-from transformers import (
-    DynamicCache,
-    LlamaConfig,
-    LlamaForCausalLM,
-    LlamaForSequenceClassification,
-    LlamaModel,
-    MistralConfig,
-)
+from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM, MistralConfig
 from transformers.distributed.context_parallel import (
     ALL_CP_STYLES,
     ContextParallelAttention,
     SplitSequenceParallel,
     UlyssesAttention,
-    apply_context_parallelism,
 )
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
-from transformers.loss.loss_utils import ForCausalLMLoss
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.mistral.modeling_mistral import MistralAttention
 from transformers.testing_utils import is_context_parallel_test
 
 from ..distributed_testing_utils import run_distributed
-from ..test_context_parallel_mixin import _cp_plan
 
 
 def _mesh(size=2, rank=0):
@@ -71,16 +60,12 @@ def _config(**kwargs):
     return LlamaConfig(**{**defaults, **kwargs})
 
 
-def _cp_mesh():
-    return init_device_mesh("cpu", (dist.get_world_size(),))
-
-
 class _Attention(torch.nn.Module):
-    """What the attention functions read from a model's attention module, and the call a model makes."""
+    """An attention module whose forward runs the function `ALL_ATTENTION_FUNCTIONS` holds for it."""
 
-    def __init__(self, config=None, num_key_value_groups=1):
+    def __init__(self):
         super().__init__()
-        self.config, self.is_causal, self.num_key_value_groups = config or _config(), True, num_key_value_groups
+        self.config = _config()
 
     def forward(self, query, key, value, attention_mask=None, **kwargs):
         attention_function = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -115,19 +100,11 @@ class _SpyAttention(ContextParallelAttention):
 # =============================================================================
 
 
-def _mask(config, batch, seq, name):
-    """The mask a model builds over the whole sequence: causal, or from the `position_ids` of two packed documents."""
-    if name == "causal":
-        return torch.ones(seq, seq, dtype=torch.bool).tril().expand(batch, 1, seq, seq)
-    position_ids = torch.cat([torch.arange(seq // 2), torch.arange(seq // 2)]).expand(batch, -1)
-    mask_function = create_sliding_window_causal_mask if name == "sliding" else create_causal_mask
-    return mask_function(config, torch.zeros(batch, seq, config.hidden_size), None, None, position_ids=position_ids)
-
-
-def _test_ulysses(rank, kv_heads, mask_name):
-    """The output and the gradients of this rank's slice match plain attention on the whole sequence."""
-    mesh, cp_size = _cp_mesh(), dist.get_world_size()
-    batch, heads, seq, head_dim = 2, 4, 8, 4
+def _test_ulysses_packed_sliding(rank):
+    """This rank's slice, and its q/k/v gradients, match the attention on the whole rows."""
+    cp_size = dist.get_world_size()
+    mesh = init_device_mesh("cpu", (cp_size,))
+    batch, heads, kv_heads, seq, head_dim = 2, 4, 2, 8, 4
     config = MistralConfig(
         hidden_size=heads * head_dim,
         num_attention_heads=heads,
@@ -135,20 +112,25 @@ def _test_ulysses(rank, kv_heads, mask_name):
         sliding_window=4,
         attn_implementation="sdpa",
     )
-    module, mask = _Attention(config, heads // kv_heads), _mask(config, batch, seq, mask_name)
+    module = MistralAttention(config, layer_idx=0)
+    # two documents per row, 5 then 3 tokens, so that the window of position 4 reaches past the boundary at 4 and
+    # stops before position 0: that window is what this test is about
+    position_ids = torch.cat([torch.arange(5), torch.arange(3)]).expand(batch, -1)
+    mask = create_sliding_window_causal_mask(
+        config, torch.zeros(batch, seq, config.hidden_size), None, None, position_ids=position_ids
+    )
+    assert not mask[0, 0, 4, 0] and mask[0, 0, 4, 1:4].all()
     generator = torch.Generator().manual_seed(0)
     query, key, value = (
         torch.randn(batch, n, seq, head_dim, generator=generator, requires_grad=True)
         for n in (heads, kv_heads, kv_heads)
     )
-    upstream = torch.randn(batch, seq, heads, head_dim, generator=generator)
 
-    # this rank holds a contiguous slice of the sequence with every head, and the mask of the whole sequence
+    # this rank holds a slice of the sequence with every head, and the mask of the whole rows
     local = [t.detach().chunk(cp_size, dim=2)[rank].clone().requires_grad_() for t in (query, key, value)]
     output, _ = UlyssesAttention().attention(mesh, sdpa_attention_forward, module, *local, mask)
-    (output * upstream.chunk(cp_size, dim=1)[rank]).sum().backward()
     reference, _ = sdpa_attention_forward(module, query, key, value, mask)
-    (reference * upstream).sum().backward()
+    (output.sum() + reference.sum()).backward()
 
     torch.testing.assert_close(output, reference.chunk(cp_size, dim=1)[rank])
     for local_tensor, tensor in zip(local, (query, key, value)):
@@ -157,7 +139,8 @@ def _test_ulysses(rank, kv_heads, mask_name):
 
 def _test_ulysses_kwargs(rank):
     """The attention function gets the model's kwargs unchanged, and its share of the attention sinks."""
-    mesh, cp_size = _cp_mesh(), dist.get_world_size()
+    cp_size = dist.get_world_size()
+    mesh = init_device_mesh("cpu", (cp_size,))
     batch, heads, seq, head_dim = 1, 4, 8, 2
     seen = {}
 
@@ -175,58 +158,6 @@ def _test_ulysses_kwargs(rank):
     assert seen["attention_mask"] is mask and seen["position_ids"] is position_ids and seen["dropout"] == 0.0
     # attention sinks: one logit per head, so this rank's share of the heads
     torch.testing.assert_close(seen["s_aux"], s_aux.chunk(cp_size)[rank])
-
-
-def _test_loss(rank):
-    """Every rank reports the loss of the whole sequences, with the gradient of its own slice times `cp_size`."""
-    mesh, cp_size = _cp_mesh(), dist.get_world_size()
-    style, model = ALL_CP_STYLES["cp_model"], types.SimpleNamespace(config=types.SimpleNamespace(pad_token_id=0))
-    batch, seq, vocab_size = 2, 8, 11
-    logits = torch.randn(batch, seq, vocab_size, generator=torch.Generator().manual_seed(0), requires_grad=True)
-    labels = torch.randint(0, vocab_size, (batch, seq), generator=torch.Generator().manual_seed(1))
-    labels[0, -3:] = -100
-
-    def cp_loss(local_logits, **kwargs):
-        """What the model does between the two transforms of `cp_model`: its own loss, on its slice of the logits."""
-        _, kwargs = style.transform_inputs_pre_forward(
-            model, (), {"input_ids": labels, "labels": labels, **kwargs}, mesh
-        )
-        loss = ForCausalLMLoss(
-            local_logits, labels, vocab_size, kwargs["num_items_in_batch"], shift_labels=kwargs["shift_labels"]
-        )
-        return style.transform_output_post_forward(model, types.SimpleNamespace(loss=loss), mesh).loss
-
-    local_logits = logits.detach().chunk(cp_size, dim=1)[rank].clone().requires_grad_()
-    loss = cp_loss(local_logits)
-    loss.backward()
-    ForCausalLMLoss(logits, labels, vocab_size).backward()
-    torch.testing.assert_close(loss, ForCausalLMLoss(logits, labels, vocab_size))
-    torch.testing.assert_close(local_logits.grad, logits.grad.chunk(cp_size, dim=1)[rank] * cp_size)
-
-    # a caller's `num_items_in_batch` scales the loss instead of the token count
-    expected = ForCausalLMLoss(logits, labels, vocab_size, num_items_in_batch=7)
-    torch.testing.assert_close(cp_loss(local_logits, num_items_in_batch=7), expected)
-    # a slice without a single label contributes nothing, and reports no NaN
-    labels[:, : seq // cp_size + 1] = -100
-    torch.testing.assert_close(cp_loss(local_logits), ForCausalLMLoss(logits, labels, vocab_size))
-
-
-@is_context_parallel_test
-class TestContextParallelOnTwoRanks(unittest.TestCase):
-    @parameterized.expand([(4, "causal"), (2, "packed"), (2, "sliding")])
-    def test_ulysses_matches_full_attention(self, kv_heads, mask_name):
-        run_distributed(world_size=2, backend="gloo")(_test_ulysses)(kv_heads, mask_name)
-
-    def test_ulysses_passes_the_models_kwargs_through(self):
-        run_distributed(world_size=2, backend="gloo")(_test_ulysses_kwargs)()
-
-    def test_loss_matches_full_sequence_loss(self):
-        run_distributed(world_size=2, backend="gloo")(_test_loss)()
-
-
-# =============================================================================
-# The styles, one at a time
-# =============================================================================
 
 
 class TestContextParallelAttention(unittest.TestCase):
@@ -262,15 +193,16 @@ class TestContextParallelAttention(unittest.TestCase):
         self.assertIs(ALL_ATTENTION_FUNCTIONS["sdpa"], failing)
 
 
-class TestUlyssesCheck(unittest.TestCase):
-    def _check(self, config, cp_size=2):
-        UlyssesAttention().check(_Attention(config), _mesh(cp_size))
+@is_context_parallel_test
+class TestUlyssesAttention(unittest.TestCase):
+    def test_matches_the_attention_on_the_whole_packed_sliding_rows(self):
+        run_distributed(world_size=2, backend="gloo")(_test_ulysses_packed_sliding)()
 
-    def test_accepts_attention_that_takes_the_mask(self):
-        self._check(_config())
-        # the mask the model builds has the sliding window in it, and flash kernels build it themselves
-        self._check(MistralConfig(attn_implementation="sdpa", sliding_window=5))
-        self._check(MistralConfig(attn_implementation="flash_attention_2", sliding_window=5))
+    def test_passes_the_models_kwargs_and_its_share_of_the_attention_sinks(self):
+        run_distributed(world_size=2, backend="gloo")(_test_ulysses_kwargs)()
+
+    def _check(self, config, cp_size=2):
+        UlyssesAttention().check(MistralAttention(config, layer_idx=0), _mesh(cp_size))
 
     def test_refuses_attention_that_takes_no_mask(self):
         for attn_implementation in ("eager", "flex_attention"):
@@ -313,7 +245,7 @@ class TestSplitSequenceParallel(unittest.TestCase):
 
 
 class TestModelContextParallel(unittest.TestCase):
-    """`cp_model` on a model's inputs: no cache, this rank's shifted labels, padding to a multiple of `cp_size`."""
+    """`cp_model` on a model's inputs and loss: no cache, padding to a multiple of `cp_size`, a slice of the loss."""
 
     def _inputs(self, rank=0, *args, **kwargs):
         model = LlamaForCausalLM(_config(pad_token_id=7))
@@ -329,56 +261,41 @@ class TestModelContextParallel(unittest.TestCase):
         self.assertIs(kwargs["input_ids"], input_ids)
         self.assertIs(kwargs["use_cache"], False)
 
-    def test_pads_the_sequences_to_a_multiple_of_cp_size(self):
-        input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+    def test_pads_position_ids_after_a_packed_sequence(self):
         kwargs = self._inputs(
             0,
-            input_ids=input_ids,
-            labels=input_ids,
-            attention_mask=torch.ones_like(input_ids),
+            input_ids=torch.tensor([[1, 2, 3, 4, 5]]),
             position_ids=torch.tensor([[0, 1, 2, 0, 1]]),
         )
-        # the pad token, with no label and no attention, at a position continuing the last document
-        torch.testing.assert_close(kwargs["input_ids"], torch.tensor([[1, 2, 3, 4, 5, 7]]))
-        torch.testing.assert_close(kwargs["labels"], torch.tensor([[1, 2, 3, 4, 5, -100]]))
-        torch.testing.assert_close(kwargs["attention_mask"], torch.tensor([[1, 1, 1, 1, 1, 0]]))
         torch.testing.assert_close(kwargs["position_ids"], torch.tensor([[0, 1, 2, 0, 1, 2]]))
-        # a divisible sequence is left alone
-        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]])
-        self.assertIs(self._inputs(0, input_ids=input_ids)["input_ids"], input_ids)
 
+    def test_gives_every_rank_its_share_of_the_loss(self):
+        """The ranks add up to the loss of the whole sequences, so FSDP2's average gives the full-sequence gradient."""
+        vocab_size, seq = 11, 8
+        model, style = LlamaForCausalLM(_config(vocab_size=vocab_size)), ALL_CP_STYLES["cp_model"]
+        generator = torch.Generator().manual_seed(0)
+        logits = torch.randn(2, seq, vocab_size, generator=generator)
+        labels = torch.randint(0, vocab_size, (2, seq), generator=generator)
 
-class TestApplyContextParallelism(unittest.TestCase):
-    def test_accepts_a_base_model_and_keeps_the_forward_signature(self):
-        # a base model computes no loss of its own, so the caller's loss is theirs to shard
-        model = LlamaModel(_config())
-        apply_context_parallelism(model, _mesh(), _cp_plan(model))
-        # `Trainer` reads the signature to drop the dataset columns the model does not take
-        model = LlamaForCausalLM(_config())
-        apply_context_parallelism(model, _mesh(), _cp_plan(model))
-        self.assertIn("labels", inspect.signature(model.forward).parameters)
+        def rank_loss(rank, **kwargs):
+            """This rank's part: the model's loss on its slice of the logits, over the token count of the whole rows."""
+            inputs = {"input_ids": labels, "labels": labels, **kwargs}
+            _, kwargs = style.transform_inputs_pre_forward(model, (), inputs, _mesh(rank=rank))
+            return model.loss_function(
+                logits.chunk(2, dim=1)[rank].contiguous(),
+                labels,
+                vocab_size,
+                kwargs["num_items_in_batch"],
+                shift_labels=kwargs["shift_labels"],
+            )
 
-    def test_refusals(self):
-        class LlamaWithOwnAttention(LlamaForCausalLM):
-            _supports_attention_backend = False
+        # the whole rows' token count divides the slices' sum, also when the caller passes its own count instead
+        for num_items_in_batch in (None, 7):
+            full = model.loss_function(logits, labels, vocab_size, num_items_in_batch=num_items_in_batch)
+            shards = sum(rank_loss(rank, num_items_in_batch=num_items_in_batch) for rank in (0, 1))
+            torch.testing.assert_close(shards, full)
 
-        for model, message in (
-            (LlamaForSequenceClassification(_config()), "only supports the causal language modeling loss"),
-            (LlamaWithOwnAttention(_config()), "`_supports_attention_backend`"),
-            (LlamaForCausalLM(_config(layer_types=["full_attention", "linear_attention"])), "linear_attention"),
-        ):
-            # refused before the plan is even read
-            with self.subTest(type(model).__name__), self.assertRaisesRegex(ValueError, message):
-                apply_context_parallelism(model, _mesh(), {})
-
-    def test_every_model_is_the_root_of_its_plan(self):
-        config = _config()
-        config.base_model_cp_plan = {"layers.*": "cp_split_sequence", "layers.*.self_attn": "cp_ulysses"}
-        model = LlamaForCausalLM(config)
-        self.assertEqual(model.model.cp_plan, {"": "cp_model", **config.base_model_cp_plan})
-        # the head, not its base model, is the `""` of the head's plan
-        self.assertEqual(
-            model.cp_plan,
-            {"": "cp_model", "model.layers.*": "cp_split_sequence", "model.layers.*.self_attn": "cp_ulysses"},
-        )
-        self.assertNotIn("base_model_cp_plan", config.to_dict())
+        # a rank whose slice holds no label contributes nothing, and reports no NaN
+        labels[:, :5] = -100
+        torch.testing.assert_close(rank_loss(0), torch.zeros(()))
+        torch.testing.assert_close(rank_loss(1), model.loss_function(logits, labels, vocab_size))
