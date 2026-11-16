@@ -130,6 +130,7 @@ class BaseModelOutputWithPast(ModelOutput):
 
             If `cache` is used only the last hidden-state of the sequences of shape `(batch_size, 1,
             hidden_size)` is output.
+        # 如果使用kvcache,说明是在decode阶段，此时只需要保留最后一个token对应的隐藏状态
         cache (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
             It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
 
@@ -148,7 +149,7 @@ class BaseModelOutputWithPast(ModelOutput):
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
     """
-
+    # 相比于BaseModelOutputWithPast区别于：1.多个cache属性。2.当cache!=none时(decode阶段)时last_hidden_state只保留最新token对应的隐藏层状态
     last_hidden_state: torch.Tensor | None = None
     cache: Cache | None = None
     hidden_states: tuple[torch.Tensor, ...] | None = None
@@ -636,8 +637,8 @@ class CausalLMOutputWithPast(ModelOutput):
             heads.
     """
 
-    loss: torch.Tensor | None = None
-    logits: torch.Tensor | None = None
+    loss: torch.Tensor | None = None            # (1,)因果语言模型的损失
+    logits: torch.Tensor | None = None            # (batch_size, seq_len, vocab_size)每个token的预测概率，是last_hidden_state(batch_size,seq_len,hidden_size)经过lmhead处理后的输出
     cache: Cache | None = None
     hidden_states: tuple[torch.Tensor, ...] | None = None
     attentions: tuple[torch.Tensor, ...] | None = None
