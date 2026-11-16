@@ -40,9 +40,10 @@ class Qwen2Config(PreTrainedConfig):
     ```"""
 
     model_type = "qwen2"
-    keys_to_ignore_at_inference = ["cache"]
+    keys_to_ignore_at_inference = ["past_key_values"]
 
-    # Default tensor parallel plan for base model `Qwen2`
+    # 默认的张量并行计划（层内并行TP）：*表示所有层，clowise表示将参数按照列并行，rowwise表示按照行并行
+    # 按照列并行需要合并，按照行并行需要相加
     base_model_tp_plan = {
         "layers.*.self_attn.q_proj": "colwise",
         "layers.*.self_attn.k_proj": "colwise",
@@ -52,6 +53,7 @@ class Qwen2Config(PreTrainedConfig):
         "layers.*.mlp.up_proj": "colwise",
         "layers.*.mlp.down_proj": "rowwise",
     }
+    # 默认流水线并行计划（层间并行PP）：这里仅仅描述各个模块的输入输出形式
     base_model_pp_plan = {
         "embed_tokens": (["input_ids"], ["inputs_embeds"]),
         "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
@@ -69,17 +71,17 @@ class Qwen2Config(PreTrainedConfig):
     initializer_range: float = 0.02
     rms_norm_eps: float = 1e-6
     use_cache: bool = True
-    tie_word_embeddings: bool = False
-    rope_parameters: RopeParameters | dict | None = None
-    use_sliding_window: bool = False
-    sliding_window: int | None = 4096
+    tie_word_embeddings: bool = False		# 输出层和嵌入层是否共用参数
+    rope_parameters: RopeParameters | dict | None = None	# RopeParameters:RoPE 参数对象	dict:Python 字典形式的 RoPE 配置
+    use_sliding_window: bool = False		# 是否使用带窗口的注意力
+    sliding_window: int | None = 4096		# 窗口大小
     max_window_layers: int = 28
-    layer_types: list[str] | None = None
+    layer_types: list[str] | None = None	# 注意力层是使用full-attention还是sliding-attention
     attention_dropout: float | int = 0.0
     pad_token_id: int | None = None
     bos_token_id: int | None = None
     eos_token_id: int | list[int] | None = None
-
+    # 调用父类中定义的 __post_init__ 方法，并把当前收到的关键字参数传递过去。
     def __post_init__(self, **kwargs):
         self.sliding_window = self.sliding_window if self.use_sliding_window else None
         if self.num_key_value_heads is None:
@@ -95,5 +97,6 @@ class Qwen2Config(PreTrainedConfig):
 
         super().__post_init__(**kwargs)
 
-
+# 当你使用 from some_module import * 时，Python 默认会把该模块里所有不以单下划线 _ 开头的变量、函数和类都导入进来。
+# 但如果模块里定义了 __all__，就只有 __all__ 列表里明确指出的名字会被导入，其他的都会被隐藏。
 __all__ = ["Qwen2Config"]
