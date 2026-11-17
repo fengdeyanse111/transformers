@@ -558,6 +558,32 @@ def sdpa_mask(
     if allow_is_bidirectional_skip and _ignore_bidirectional_mask_sdpa(padding_mask, kv_length, local_size):
         return None
 
+      # sdpa_mask() 创建 arange:
+      # batch_arange  [0,1,...,B-1]          shape (B,)
+      # head_arange   [0]                    shape (1,)
+      # q_arange      [0,1,...,Q-1] + q_off  shape (Q,)
+      # kv_arange     [0,1,...,KV-1] + kv_off shape (KV,)
+    
+      #       ↓ _non_vmap_expansion_sdpa 广播维度
+    
+      # batch_idx  (B, 1, 1, 1)  ─┐
+      # head_idx   (1, 1, 1, 1)   ├─ 传入 and_mask(batch_idx, head_idx, q_idx, kv_idx)
+      # q_idx      (1, 1, Q, 1)   │
+      # kv_idx     (1, 1, 1, KV) ─┘
+    
+      #       ↓ and_mask 内部循环
+    
+      # causal_mask_function(batch_idx, head_idx, q_idx, kv_idx)
+      #   → kv_idx <= q_idx
+      #   → (1,1,1,KV) <= (1,1,Q,1)  ──广播──→  (B,1,Q,KV) bool
+    
+      # padding_mask_function(pad)(batch_idx, head_idx, q_idx, kv_idx)
+      #   → pad[batch_idx, kv_idx]
+      #   → pad[(B,1,1,1), (1,1,1,KV)]  ──广播──→  (B,1,Q,KV) bool
+    
+      #       ↓ 逐元素 &
+    
+      # result: (B, 1, Q, KV) bool  ← 最终 4D 注意力 mask
     # Potentially add the padding 2D mask
     if padding_mask is not None:
         mask_function = and_masks(mask_function, padding_mask_function(padding_mask))
