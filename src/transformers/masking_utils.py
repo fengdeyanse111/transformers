@@ -408,7 +408,27 @@ def _non_vmap_expansion_sdpa(
     kv_indices = kv_indices[None, None, None, :]
     return batch_indices, head_indices, q_indices, kv_indices
 
-
+# sdpa_mask(batch_size, q_length, kv_length, q_offset, kv_offset, mask_function, attention_mask, ...)
+# ├─ 1. prepare_padding_mask(attention_mask, kv_length, kv_offset)
+# │     └─ 如果 attention_mask 太短，右侧填 0
+# │
+# ├─ 2. 尝试跳过
+# │     ├─ allow_is_causal_skip && _ignore_causal_mask_sdpa(...) → return None
+# │     │     └─ q_len==1 或 kv_len==q_len 且无 padding → 用 SDPA 的 is_causal
+# │     └─ allow_is_bidirectional_skip && _ignore_bidirectional_mask_sdpa(...) → return None
+# │           └─ 全 attention 无 padding → 不需要 mask
+# │
+# ├─ 3. 如果有 padding_mask → mask_function = and_masks(mask_function, padding_mask_function)
+# │
+# ├─ 4. 构造索引张量（带 offset）
+# │     batch_arange = [0..B-1]
+# │     head_arange  = [0]
+# │     q_arange     = [q_offset .. q_offset + Q - 1]
+# │     kv_arange    = [kv_offset .. kv_offset + KV - 1]
+# │
+# └─ 5. 应用 mask_function
+#      ├─ 非 vmap: 广播 4 个维度 → mask_function(b,h,q,kv) → (B,1,Q,KV) bool
+#      └─ vmap:    torch.vmap 四次 → mask_function(b,h,q,kv) → (B,1,Q,KV) bool
 def sdpa_mask(
     batch_size: int,
     q_length: int,
