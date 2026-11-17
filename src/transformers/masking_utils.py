@@ -1039,6 +1039,7 @@ def create_causal_mask(
 
     # Do not allow skip if we are compiling and decoding (but for prefill, we still allow skip to optimize the perfs since
     # prefill is not compiled)
+    # 对于我们的DynamicCache，这里allow_is_casual_skip = True
     allow_is_causal_skip = allow_is_causal_skip and not (getattr(cache, "is_compileable", False) and q_length == 1)
 
     # Allow slight deviations from causal mask
