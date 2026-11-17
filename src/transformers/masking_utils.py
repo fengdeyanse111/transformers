@@ -915,7 +915,24 @@ def find_first_full_attention_index(cache: Cache | None) -> int:
 
     return layer_idx
 
-
+ # create_causal_mask
+ # ├─ is_causal=False? → create_bidirectional_mask
+ # ├─ 确定 layer_idx（混合 cache 时找 full attention 层）
+ # ├─ _preprocess_mask_arguments
+ # │   ├─ 4D mask / PagedAttention / 非标准后端 → 直接返回
+ # │   ├─ 从 cache 或 attention_mask 推断 q_length/kv_length/q_offset/kv_offset
+ # │   └─ 检测 packed sequence
+ # ├─ 组装 mask_function
+ # │   ├─ causal_mask_function（kv_idx <= q_idx）
+ # │   ├─ + or_mask_function（取并集）
+ # │   ├─ + and_mask_function（取交集）
+ # │   ├─ + packed_sequence 独立化
+ # │   └─ + blockwise_overlay（MLLM）
+ # └─ mask_interface（按后端分发）
+ #     ├─ sdpa_mask → bool tensor 或 None（加速）
+ #     ├─ eager_mask → float tensor（0/-inf）
+ #     ├─ flash_attention_mask → 2D mask 或 None
+ #     └─ flex_attention_mask → BlockMask
 @deprecate_kwarg("past_key_values", "5.40.0", new_name="cache")
 def create_causal_mask(
     config: PreTrainedConfig,
